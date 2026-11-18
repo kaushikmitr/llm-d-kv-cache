@@ -1,0 +1,306 @@
+// Copyright 2026 The llm-d Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package peer
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"sync"
+	"time"
+
+	"github.com/llm-d/llm-d-kv-cache/pkg/kvtier/pool"
+	"github.com/llm-d/llm-d-kv-cache/pkg/kvtier/protocol"
+)
+
+// RDMAHelper is a client for the node's RDMA helper process
+// (llmd_kv_tiering.rdma_helper). The helper maps the daemon's pool,
+// registers it with NIXL, and performs RDMA reads from peer pools into
+// local slots. Requests and responses are JSON lines over a Unix socket.
+type RDMAHelper struct {
+	path string
+
+	mu   sync.Mutex
+	conn net.Conn
+	rd   *bufio.Reader
+	info *RDMAInfo
+}
+
+// RDMAInfo identifies a helper to its peers.
+type RDMAInfo struct {
+	Name      string `json:"name"`
+	Metadata  []byte `json:"metadata"`
+	Base      uint64 `json:"base"`
+	SlotBytes uint64 `json:"slot_bytes"`
+}
+
+type rdmaRequest struct {
+	Op         string     `json:"op"`
+	Peer       string     `json:"peer,omitempty"`
+	PeerMeta   []byte     `json:"peer_metadata,omitempty"`
+	RemoteBase uint64     `json:"remote_base,omitempty"`
+	SlotBytes  uint64     `json:"slot_bytes,omitempty"`
+	Pairs      [][2]int64 `json:"pairs,omitempty"` // [local slot, remote slot]
+}
+
+type rdmaResponse struct {
+	Error string `json:"error,omitempty"`
+	RDMAInfo
+}
+
+// NewRDMAHelper returns a client for the helper at path. It connects on
+// first use.
+func NewRDMAHelper(path string) *RDMAHelper {
+	return &RDMAHelper{path: path}
+}
+
+func (h *RDMAHelper) call(ctx context.Context, req *rdmaRequest, timeout time.Duration) (*rdmaResponse, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.conn == nil {
+		d := net.Dialer{Timeout: timeout}
+		conn, err := d.DialContext(ctx, "unix", h.path)
+		if err != nil {
+			return nil, fmt.Errorf("rdma helper: %w", err)
+		}
+		h.conn = conn
+		h.rd = bufio.NewReader(conn)
+	}
+	fail := func(err error) error {
+		if cerr := h.conn.Close(); cerr != nil {
+			err = errors.Join(err, cerr)
+		}
+		h.conn, h.rd = nil, nil
+		return fmt.Errorf("rdma helper: %w", err)
+	}
+	if err := h.conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return nil, fail(err)
+	}
+	line, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := h.conn.Write(append(line, '\n')); err != nil {
+		return nil, fail(err)
+	}
+	out, err := h.rd.ReadBytes('\n')
+	if err != nil {
+		return nil, fail(err)
+	}
+	resp := &rdmaResponse{}
+	if err := json.Unmarshal(out, resp); err != nil {
+		return nil, fail(err)
+	}
+	if resp.Error != "" {
+		return nil, fmt.Errorf("rdma helper: %s", resp.Error)
+	}
+	return resp, nil
+}
+
+// Info returns the helper's identity, cached after the first call.
+func (h *RDMAHelper) Info(ctx context.Context, timeout time.Duration) (*RDMAInfo, error) {
+	h.mu.Lock()
+	cached := h.info
+	h.mu.Unlock()
+	if cached != nil {
+		return cached, nil
+	}
+	resp, err := h.call(ctx, &rdmaRequest{Op: "info"}, timeout)
+	if err != nil {
+		return nil, err
+	}
+	info := resp.RDMAInfo
+	h.mu.Lock()
+	h.info = &info
+	h.mu.Unlock()
+	return &info, nil
+}
+
+// Read copies remote slots into local slots with RDMA reads.
+func (h *RDMAHelper) Read(ctx context.Context, peer string, peerMeta []byte, remoteBase, slotBytes uint64,
+	pairs [][2]int64, timeout time.Duration,
+) error {
+	_, err := h.call(ctx, &rdmaRequest{
+		Op: "read", Peer: peer, PeerMeta: peerMeta, RemoteBase: remoteBase,
+		SlotBytes: slotBytes, Pairs: pairs,
+	}, timeout)
+	return err
+}
+
+// serveRDMA answers an RDMA peer_get: it sends the slots of the found
+// blocks and this helper's identity, then waits for the destination's
+// peer_release before it drops the pins. It returns handled=false when the
+// helper is unavailable, so the caller can send the bytes over TCP.
+func (n *Node) serveRDMA(conn net.Conn, req, resp *protocol.Message, slots []int64, found [][]byte,
+	arena *pool.Arena, sid pool.SessionID,
+) (bool, error) {
+	info, err := n.rdma.Info(context.Background(), n.opts.Timeout)
+	if err != nil {
+		n.log.Warn("rdma unavailable, serving over TCP", "err", err)
+		return false, nil
+	}
+	if info.SlotBytes != arena.SlotBytes() {
+		n.log.Warn("rdma helper slot size differs from the pool, serving over TCP",
+			"helper", info.SlotBytes, "pool", arena.SlotBytes())
+		return false, nil
+	}
+	resp.RDMA = true
+	resp.Slots = slots
+	resp.Agent = info.Name
+	resp.AgentMeta = info.Metadata
+	resp.Base = info.Base
+	if err := writeFrame(conn, resp); err != nil {
+		return true, err
+	}
+	// The destination reads the slots now. Keep them pinned until it says
+	// it is done, or the timeout passes.
+	if err := conn.SetReadDeadline(time.Now().Add(n.opts.Timeout)); err != nil {
+		return true, err
+	}
+	rel, err := protocol.Read(conn)
+	if err != nil {
+		return true, fmt.Errorf("waiting for peer_release: %w", err)
+	}
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		return true, err
+	}
+	if rel.Op != protocol.OpPeerRelease {
+		return true, fmt.Errorf("expected %s, got %s", protocol.OpPeerRelease, rel.Op)
+	}
+	n.store.Unpin(sid, req.Namespace, found)
+	if rel.Error != "" {
+		return true, nil // the destination's read failed; keep the blocks
+	}
+	n.Served.Add(uint64(len(found)))
+	n.BytesOut.Add(uint64(len(found)) * arena.SlotBytes())
+	if req.Evict && len(found) > 0 {
+		n.remove(req.Namespace, found)
+	}
+	return true, nil
+}
+
+// rdmaReady reports whether this node's RDMA helper answers. Without it,
+// fetches use TCP.
+func (n *Node) rdmaReady(ctx context.Context) bool {
+	if n.rdma == nil {
+		return false
+	}
+	if _, err := n.rdma.Info(ctx, n.opts.Timeout); err != nil {
+		n.log.Debug("rdma helper not ready, fetching over TCP", "err", err)
+		return false
+	}
+	return true
+}
+
+// fetchRDMA asks the source for want in RDMA mode and reads the blocks
+// from its pool into the reserved local slots. A source without an RDMA
+// helper answers with the bytes over TCP instead, which is read here too.
+func (n *Node) fetchRDMA(ctx context.Context, endpoint, ns string, want [][]byte, wantIdx []int,
+	slots []int64, status []uint8, ok []bool, evict bool, arena *pool.Arena,
+) error {
+	conn, err := n.get(ctx, endpoint)
+	if err != nil {
+		return err
+	}
+	deadline := time.Now().Add(n.opts.Timeout)
+	if dl, has := ctx.Deadline(); has {
+		deadline = dl
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		n.put(endpoint, conn, false)
+		return err
+	}
+	healthy := false
+	defer func() { n.put(endpoint, conn, healthy) }()
+
+	req := &protocol.Message{
+		ID: 1, Op: protocol.OpPeerGet, Namespace: ns, Keys: want, Evict: evict,
+		SlotBytes: arena.SlotBytes(), RDMA: true,
+	}
+	if err := writeFrame(conn, req); err != nil {
+		return err
+	}
+	resp, err := protocol.Read(conn)
+	if err != nil {
+		return err
+	}
+	if resp.Error != "" {
+		healthy = true
+		return fmt.Errorf("source %s: %s", endpoint, resp.Error)
+	}
+	if len(resp.Status) != len(want) {
+		return fmt.Errorf("source %s returned %d statuses for %d keys", endpoint, len(resp.Status), len(want))
+	}
+	if !resp.RDMA {
+		// The source has no RDMA helper: the bytes follow on this stream.
+		for j, st := range resp.Status {
+			i := wantIdx[j]
+			if st != protocol.FetchOK {
+				status[i] = protocol.FetchMissing
+				continue
+			}
+			if _, err := io.ReadFull(conn, arena.Slot(slots[i])); err != nil {
+				status[i] = protocol.FetchFailed
+				return err
+			}
+			n.BytesIn.Add(arena.SlotBytes())
+			ok[j] = true
+			status[i] = protocol.FetchOK
+		}
+		healthy = true
+		return nil
+	}
+
+	var pairs [][2]int64
+	var idx []int
+	for j, st := range resp.Status {
+		i := wantIdx[j]
+		if st != protocol.FetchOK || j >= len(resp.Slots) || resp.Slots[j] < 0 {
+			status[i] = protocol.FetchMissing
+			continue
+		}
+		pairs = append(pairs, [2]int64{slots[i], resp.Slots[j]})
+		idx = append(idx, j)
+	}
+	readErr := error(nil)
+	if len(pairs) > 0 {
+		readErr = n.rdma.Read(ctx, resp.Agent, resp.AgentMeta, resp.Base, arena.SlotBytes(), pairs, n.opts.Timeout)
+	}
+	release := &protocol.Message{ID: 2, Op: protocol.OpPeerRelease}
+	if readErr != nil {
+		release.Error = readErr.Error()
+	}
+	if err := writeFrame(conn, release); err != nil {
+		return errors.Join(readErr, err)
+	}
+	if readErr != nil {
+		for _, j := range idx {
+			status[wantIdx[j]] = protocol.FetchFailed
+		}
+		healthy = true
+		return readErr
+	}
+	for _, j := range idx {
+		ok[j] = true
+		status[wantIdx[j]] = protocol.FetchOK
+		n.BytesIn.Add(arena.SlotBytes())
+	}
+	healthy = true
+	return nil
+}
