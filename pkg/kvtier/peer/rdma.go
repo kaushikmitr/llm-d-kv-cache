@@ -51,7 +51,10 @@ type RDMAInfo struct {
 }
 
 type rdmaRequest struct {
-	Op         string     `json:"op"`
+	Op string `json:"op"`
+	// TimeoutS is the helper's deadline for the request, counted from when
+	// it receives it. Every transfer it starts ends by then, or it exits.
+	TimeoutS   float64    `json:"timeout_s,omitempty"`
 	Peer       string     `json:"peer,omitempty"`
 	PeerMeta   []byte     `json:"peer_metadata,omitempty"`
 	RemoteBase uint64     `json:"remote_base,omitempty"`
@@ -61,8 +64,30 @@ type rdmaRequest struct {
 
 type rdmaResponse struct {
 	Error string `json:"error,omitempty"`
+	// Unsafe means the helper could not confirm that every transfer it
+	// started has stopped. It exits after sending this, which stops them.
+	Unsafe bool `json:"unsafe,omitempty"`
 	RDMAInfo
 }
+
+// rdmaMargin is the slack between the deadlines of the parties to an RDMA
+// transfer. The helper ends every transfer, or exits, within the transfer
+// timeout T. Its daemon waits T+margin for it. The other daemon waits
+// T+2*margin. So a party that gives up knows the transfer has stopped.
+const rdmaMargin = 10 * time.Second
+
+// ErrRDMAUnsafe means an RDMA transfer failed in a way that leaves its
+// memory state unknown: a transfer may still be running. Memory it could
+// write must not be reused until the helper that ran it has exited, which
+// happens within the transfer timeout.
+var ErrRDMAUnsafe = errors.New("rdma transfer state unknown")
+
+// helperWait is how long a daemon waits for its own helper.
+func (n *Node) helperWait() time.Duration { return n.opts.Timeout + rdmaMargin }
+
+// peerWait is how long a daemon waits for the other daemon in an RDMA
+// transfer.
+func (n *Node) peerWait() time.Duration { return n.opts.Timeout + 2*rdmaMargin }
 
 // NewRDMAHelper returns a client for the helper at path. It connects on
 // first use.
@@ -96,16 +121,28 @@ func (h *RDMAHelper) call(ctx context.Context, req *rdmaRequest, timeout time.Du
 	if err != nil {
 		return nil, err
 	}
+	// Once a request may have reached the helper, a failure without a
+	// clean answer leaves the transfer's state unknown.
+	unsafe := func(err error) error {
+		if req.Op == "info" {
+			return err
+		}
+		return fmt.Errorf("%w: %w", ErrRDMAUnsafe, err)
+	}
 	if _, err := h.conn.Write(append(line, '\n')); err != nil {
-		return nil, fail(err)
+		return nil, unsafe(fail(err))
 	}
 	out, err := h.rd.ReadBytes('\n')
 	if err != nil {
-		return nil, fail(err)
+		return nil, unsafe(fail(err))
 	}
 	resp := &rdmaResponse{}
 	if err := json.Unmarshal(out, resp); err != nil {
-		return nil, fail(err)
+		return nil, unsafe(fail(err))
+	}
+	if resp.Unsafe {
+		h.info = nil // a restarted helper has new metadata
+		return nil, unsafe(fail(errors.New(resp.Error)))
 	}
 	if resp.Error != "" {
 		return nil, fmt.Errorf("rdma helper: %s", resp.Error)
@@ -138,8 +175,8 @@ func (h *RDMAHelper) Read(ctx context.Context, peer string, peerMeta []byte, rem
 ) error {
 	_, err := h.call(ctx, &rdmaRequest{
 		Op: "read", Peer: peer, PeerMeta: peerMeta, RemoteBase: remoteBase,
-		SlotBytes: slotBytes, Pairs: pairs,
-	}, timeout)
+		SlotBytes: slotBytes, Pairs: pairs, TimeoutS: timeout.Seconds(),
+	}, timeout+rdmaMargin)
 	return err
 }
 
@@ -169,8 +206,9 @@ func (n *Node) serveRDMA(conn net.Conn, req, resp *protocol.Message, slots []int
 		return true, err
 	}
 	// The destination reads the slots now. Keep them pinned until it says
-	// it is done, or the timeout passes.
-	if err := conn.SetReadDeadline(time.Now().Add(n.opts.Timeout)); err != nil {
+	// it is done. It waits at most helperWait for its helper, so by
+	// peerWait its read has finished, or the destination has discarded it.
+	if err := conn.SetReadDeadline(time.Now().Add(n.peerWait())); err != nil {
 		return true, err
 	}
 	rel, err := protocol.Read(conn)
@@ -218,10 +256,7 @@ func (n *Node) fetchRDMA(ctx context.Context, endpoint, ns string, want [][]byte
 	if err != nil {
 		return err
 	}
-	deadline := time.Now().Add(n.opts.Timeout)
-	if dl, has := ctx.Deadline(); has {
-		deadline = dl
-	}
+	deadline := time.Now().Add(n.peerWait())
 	if err := conn.SetDeadline(deadline); err != nil {
 		n.put(endpoint, conn, false)
 		return err
@@ -309,12 +344,18 @@ func (n *Node) fetchRDMA(ctx context.Context, endpoint, ns string, want [][]byte
 // should fetch them into its pool instead.
 var ErrNoRemoteRDMA = errors.New("source does not serve RDMA")
 
+// errUnsafeCode is the error a source sends when a push failed with its
+// state unknown. The destination maps it to ErrRDMAUnsafe.
+const errUnsafeCode = "rdma_unsafe"
+
 // Write copies local slots to remote addresses with RDMA writes. Each pair
 // is [local slot, remote address].
 func (h *RDMAHelper) Write(ctx context.Context, peerMeta []byte, slotBytes uint64, pairs [][2]int64,
 	timeout time.Duration,
 ) error {
-	_, err := h.call(ctx, &rdmaRequest{Op: "write", PeerMeta: peerMeta, SlotBytes: slotBytes, Pairs: pairs}, timeout)
+	_, err := h.call(ctx, &rdmaRequest{
+		Op: "write", PeerMeta: peerMeta, SlotBytes: slotBytes, Pairs: pairs, TimeoutS: timeout.Seconds(),
+	}, timeout+rdmaMargin)
 	return err
 }
 
@@ -330,7 +371,7 @@ func (n *Node) PushRemote(ctx context.Context, endpoint, ns string, keys [][]byt
 	if err != nil {
 		return nil, err
 	}
-	if err := conn.SetDeadline(time.Now().Add(n.opts.Timeout)); err != nil {
+	if err := conn.SetDeadline(time.Now().Add(n.peerWait())); err != nil {
 		n.put(endpoint, conn, false)
 		return nil, err
 	}
@@ -340,17 +381,20 @@ func (n *Node) PushRemote(ctx context.Context, endpoint, ns string, keys [][]byt
 	}
 	if err := writeFrame(conn, req); err != nil {
 		n.put(endpoint, conn, false)
-		return nil, err
+		// Part of the request may have reached the source.
+		return nil, fmt.Errorf("%w: %w", ErrRDMAUnsafe, err)
 	}
 	resp, err := protocol.Read(conn)
 	if err != nil {
 		n.put(endpoint, conn, false)
-		return nil, err
+		return nil, fmt.Errorf("%w: no answer from %s: %w", ErrRDMAUnsafe, endpoint, err)
 	}
 	n.put(endpoint, conn, true)
 	switch {
 	case resp.Error == "no_rdma":
 		return nil, ErrNoRemoteRDMA
+	case resp.Error == errUnsafeCode:
+		return nil, fmt.Errorf("%w: source %s", ErrRDMAUnsafe, endpoint)
 	case resp.Error != "":
 		return nil, fmt.Errorf("source %s: %s", endpoint, resp.Error)
 	case len(resp.Status) != len(keys):
@@ -387,12 +431,8 @@ func (n *Node) servePush(conn net.Conn, req, resp *protocol.Message, slots []int
 	}
 	if len(pairs) > 0 {
 		if err := n.rdma.Write(context.Background(), req.DstMeta, arena.SlotBytes(), pairs, n.opts.Timeout); err != nil {
+			pushFailed(resp, slots, err)
 			n.log.Warn("rdma push failed", "err", err)
-			for i, s := range slots {
-				if s >= 0 {
-					resp.Status[i] = protocol.FetchFailed
-				}
-			}
 			return writeFrame(conn, resp)
 		}
 	}
@@ -438,4 +478,19 @@ func (n *Node) fetchPush(ctx context.Context, endpoint, ns string, want [][]byte
 		}
 	}
 	return nil
+}
+
+// pushFailed marks every found block of a failed push as failed. When the
+// failure leaves writes into the destination's memory possibly in flight,
+// it tells the destination, which must not reuse that memory until our
+// helper, which exits on such a failure, is gone.
+func pushFailed(resp *protocol.Message, slots []int64, err error) {
+	for i, s := range slots {
+		if s >= 0 {
+			resp.Status[i] = protocol.FetchFailed
+		}
+	}
+	if errors.Is(err, ErrRDMAUnsafe) {
+		resp.Error = errUnsafeCode
+	}
 }

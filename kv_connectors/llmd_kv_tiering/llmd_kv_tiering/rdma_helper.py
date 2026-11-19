@@ -33,6 +33,14 @@ Requests and responses are JSON lines:
 RDMA WRITE is preferred where the source can push: on 4 KiB pages a
 WRITE reaches about twice the bandwidth of a READ.
 
+Transfer lifetime. A request may carry "timeout_s", counted from when the
+helper receives it. Every transfer the helper starts reaches DONE or ERR
+before it answers, so a plain error means no transfer is still running.
+If the deadline passes with transfers still running, or their state
+cannot be read, the helper answers {"error", "unsafe": true} and exits.
+Exiting closes its RDMA connections, which stops the transfers, so the
+daemons know that memory is safe to reuse once the helper is gone.
+
 Run it as: python -m llmd_kv_tiering.rdma_helper --daemon-socket S --listen-socket L
 """
 
@@ -40,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import hashlib
 import json
 import logging
@@ -187,37 +196,59 @@ class Helper:
             self._peer_by_meta[digest] = name
         return name
 
-    def _run(self, op: str, runs: list[tuple[int, int, int]], peer: str) -> dict:
+    def _run(self, op: str, runs: list[tuple[int, int, int]], peer: str, deadline: float) -> dict:
         """Run `op` over (local_offset, remote_address, length) runs, in
-        parallel groups, and wait for all of them."""
+        parallel groups, and wait until every started transfer is DONE or
+        ERR. Returns {"unsafe": True} when that cannot be confirmed."""
         handles = []
-        try:
-            for group in split_runs(runs, self.parallel):
+        error = None
+        for group in split_runs(runs, self.parallel):
+            try:
                 local = self.agent.get_xfer_descs([(self.base + lo, n, 0) for lo, _ra, n in group], "DRAM")
                 remote = self.agent.get_xfer_descs([(ra, n, 0) for _lo, ra, n in group], "DRAM")
                 handle = self.agent.initialize_xfer(op, local, remote, peer)
-                handles.append(handle)
-                if self.agent.transfer(handle) == "ERR":
-                    return {"error": f"RDMA {op} failed to start"}
-            deadline = time.monotonic() + self.timeout
-            pending = list(handles)
-            while pending:
-                if time.monotonic() > deadline:
-                    return {"error": f"RDMA {op} timed out"}
-                still = []
-                for handle in pending:
+            except Exception as e:  # noqa: BLE001 - stop starting, wait for the rest
+                error = f"RDMA {op} setup failed: {e}"
+                break
+            handles.append(handle)
+            try:
+                started = self.agent.transfer(handle)
+            except Exception as e:  # noqa: BLE001 - its state is unknown
+                return {"error": f"RDMA {op} start raised: {e}", "unsafe": True}
+            if started == "ERR":
+                error = f"RDMA {op} failed to start"
+                break
+        # Wait for every started transfer, even after a failure: freeing a
+        # handle does not stop its DMA.
+        pending = list(handles)
+        while pending:
+            if time.monotonic() > deadline:
+                return {"error": f"RDMA {op} timed out with {len(pending)} transfers running", "unsafe": True}
+            still = []
+            for handle in pending:
+                try:
                     state = self.agent.check_xfer_state(handle)
-                    if state == "ERR":
-                        return {"error": f"RDMA {op} failed"}
-                    if state != "DONE":
-                        still.append(handle)
-                pending = still
-        finally:
-            for handle in handles:
-                self.agent.release_xfer_handle(handle)
-        return {}
+                except Exception as e:  # noqa: BLE001 - its state is unknown
+                    return {"error": f"RDMA {op} state check raised: {e}", "unsafe": True}
+                if state == "ERR":
+                    error = error or f"RDMA {op} failed"
+                elif state != "DONE":
+                    still.append(handle)
+            pending = still
+        for handle in handles:
+            self.agent.release_xfer_handle(handle)
+        return {"error": error} if error else {}
 
-    def write(self, req: dict) -> dict:
+    def _deadline(self, req: dict, received: float) -> float:
+        timeout = req.get("timeout_s") or self.timeout
+        return received + float(timeout)
+
+    def _locked(self, deadline: float) -> bool:
+        """Take the transfer lock, unless the deadline passes first."""
+        return self._lock.acquire(timeout=max(0.0, deadline - time.monotonic()))
+
+    def write(self, req: dict, received: float) -> dict:
+        deadline = self._deadline(req, received)
         slot_bytes = int(req["slot_bytes"])
         if slot_bytes != self.slot_bytes:
             return {"error": f"slot size {slot_bytes} does not match local {self.slot_bytes}"}
@@ -225,11 +256,16 @@ class Helper:
         for lo, _ra, n in runs:
             if lo + n > self.size:
                 return {"error": "local slot outside the pool"}
-        with self._lock:
+        if not self._locked(deadline):
+            return {"error": "RDMA WRITE timed out before it started"}
+        try:
             peer = self._peer(req["peer_metadata"])
-            return self._run("WRITE", runs, peer)
+            return self._run("WRITE", runs, peer, deadline)
+        finally:
+            self._lock.release()
 
-    def read(self, req: dict) -> dict:
+    def read(self, req: dict, received: float) -> dict:
+        deadline = self._deadline(req, received)
         slot_bytes = int(req["slot_bytes"])
         if slot_bytes != self.slot_bytes:
             return {"error": f"slot size {slot_bytes} does not match local {self.slot_bytes}"}
@@ -238,9 +274,13 @@ class Helper:
         for lo, _ro, n in runs:
             if lo + n > self.size:
                 return {"error": "local slot outside the pool"}
-        with self._lock:
+        if not self._locked(deadline):
+            return {"error": "RDMA READ timed out before it started"}
+        try:
             peer = self._peer(req["peer_metadata"])
-            return self._run("READ", [(lo, remote_base + ro, n) for lo, ro, n in runs], peer)
+            return self._run("READ", [(lo, remote_base + ro, n) for lo, ro, n in runs], peer, deadline)
+        finally:
+            self._lock.release()
 
 
 def serve(helper: Helper, path: str) -> None:
@@ -255,22 +295,32 @@ def serve(helper: Helper, path: str) -> None:
     def handle(conn: socket.socket) -> None:
         with conn, conn.makefile("rwb") as f:
             for line in f:
+                received = time.monotonic()
                 try:
                     req = json.loads(line)
                     op = req.get("op")
                     if op == "info":
                         resp = helper.info()
                     elif op == "read":
-                        resp = helper.read(req)
+                        resp = helper.read(req, received)
                     elif op == "write":
-                        resp = helper.write(req)
+                        resp = helper.write(req, received)
                     else:
                         resp = {"error": f"unknown op {op!r}"}
                 except Exception as e:  # noqa: BLE001 - every failure becomes a response
                     logger.exception("request failed")
+                    # Transfers are started only inside _run, which reports
+                    # its own failures; an exception elsewhere started none.
                     resp = {"error": str(e)}
-                f.write(json.dumps(resp).encode() + b"\n")
-                f.flush()
+                with contextlib.suppress(OSError):
+                    f.write(json.dumps(resp).encode() + b"\n")
+                    f.flush()
+                if resp.get("unsafe"):
+                    # Transfers may still be running. Exiting closes this
+                    # process's RDMA connections, which stops them; the
+                    # helper is restarted with its container.
+                    logger.critical("exiting: %s", resp.get("error"))
+                    os._exit(1)
 
     while True:
         conn, _ = srv.accept()

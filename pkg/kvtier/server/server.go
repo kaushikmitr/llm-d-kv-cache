@@ -70,7 +70,6 @@ type Server struct {
 	grace    time.Duration
 	releases sync.WaitGroup
 	stop     chan struct{}
-
 }
 
 type session struct {

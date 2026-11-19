@@ -340,7 +340,17 @@ func (n *Node) Fetch(ctx context.Context, endpoint, ns string, keys [][]byte, ev
 		return nil, errors.New("pool not initialised")
 	}
 	sid := n.session()
-	defer n.store.ReleaseSession(sid)
+	// An RDMA failure with unknown state may leave writes in flight into
+	// the reserved slots. Then they are held until the helper that ran
+	// them has exited (quarantine), not freed at once.
+	unsafe := false
+	defer func() {
+		if !unsafe {
+			n.store.ReleaseSession(sid)
+			return
+		}
+		time.AfterFunc(n.helperWait(), func() { n.store.ReleaseSession(sid) })
+	}()
 
 	var slots []int64
 	var st []pool.AllocStatus
@@ -380,7 +390,7 @@ func (n *Node) Fetch(ctx context.Context, endpoint, ns string, keys [][]byte, ev
 		// cannot push is read from instead, or sends over TCP.
 		mode = "rdma-write"
 		err = n.fetchPush(ctx, endpoint, ns, want, wantIdx, slots, status, ok, evict, arena)
-		if errors.Is(err, ErrNoRemoteRDMA) {
+		if errors.Is(err, ErrNoRemoteRDMA) && !errors.Is(err, ErrRDMAUnsafe) {
 			mode = "rdma-read"
 			err = n.fetchRDMA(ctx, endpoint, ns, want, wantIdx, slots, status, ok, evict, arena)
 		}
@@ -404,10 +414,25 @@ func (n *Node) Fetch(ctx context.Context, endpoint, ns string, keys [][]byte, ev
 	n.log.Info("fetched blocks", "source", endpoint, "blocks", got, "of", len(want),
 		"bytes", got*arena.SlotBytes(), "mode", mode, "ms", el.Milliseconds(),
 		"gbps", float64(got*arena.SlotBytes())*8/el.Seconds()/1e9)
+	commitKeys, commitOK := want, ok
+	if errors.Is(err, ErrRDMAUnsafe) {
+		unsafe = true
+		n.log.Warn("rdma fetch state unknown; holding its slots until the transfer has surely stopped",
+			"source", endpoint, "hold", n.helperWait(), "err", err)
+		// Commit only the blocks that arrived. The rest stay reserved, and
+		// the deferred release frees them after the quarantine.
+		commitKeys, commitOK = nil, nil
+		for j, o := range ok {
+			if o {
+				commitKeys = append(commitKeys, want[j])
+				commitOK = append(commitOK, true)
+			}
+		}
+	}
 	var stored []pool.KeyRef
 	var cerr error
 	n.notify.Ordered(func() {
-		stored, cerr = n.store.Commit(sid, ns, want, ok)
+		stored, cerr = n.store.Commit(sid, ns, commitKeys, commitOK)
 		if len(stored) > 0 {
 			n.notify.AnnounceStored(ns, stored)
 		}

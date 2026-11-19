@@ -48,6 +48,8 @@ type fakeHelper struct {
 	fabric *fakeFabric
 	writes atomic.Int64
 	reads  atomic.Int64
+	// unsafeWrite makes writes fail as if transfers were left running.
+	unsafeWrite atomic.Bool
 }
 
 func (f *fakeFabric) arena(name string) (*pool.Arena, error) {
@@ -77,6 +79,9 @@ func (h *fakeHelper) handle(req *fakeRequest) any {
 	case "info":
 		return map[string]any{"name": h.name, "metadata": []byte(h.name), "base": 0, "slot_bytes": local.SlotBytes()}
 	case "write":
+		if h.unsafeWrite.Load() {
+			return map[string]any{"error": "timed out with transfers running", "unsafe": true}
+		}
 		dst, err := h.fabric.arena(string(peerMeta))
 		if err != nil {
 			return map[string]string{"error": err.Error()}
@@ -230,5 +235,36 @@ func TestFetchFallsBackWhenSourceHasNoRDMA(t *testing.T) {
 	}
 	if hb.reads.Load() != 0 {
 		t.Fatalf("destination ran %d RDMA reads against a source with no helper", hb.reads.Load())
+	}
+}
+
+func TestUnsafePushHoldsTheDestinationSlots(t *testing.T) {
+	fabric := &fakeFabric{stores: map[string]*pool.Store{}}
+	a, ha := startRDMADaemon(t, fabric, "a", true)
+	b, _ := startRDMADaemon(t, fabric, "b", true)
+	ca, cb := dial(t, a.sock, "ns"), dial(t, b.sock, "ns")
+	k := vllmKey(1)
+	ca.storeBlock(k, "late")
+	ha.unsafeWrite.Store(true)
+
+	r := cb.call(&protocol.Message{Op: protocol.OpFetch, Endpoint: a.endpoint, Keys: [][]byte{k}})
+	if r.Status[0] != protocol.FetchFailed {
+		t.Fatalf("status %v, want failed", r.Status)
+	}
+	if b.store.Has("ns", k) {
+		t.Fatal("a block with unknown transfer state was committed")
+	}
+	// Writes may still land in the slot b reserved, so b holds it: only
+	// three of its four slots can be allocated now.
+	keys := [][]byte{vllmKey(10), vllmKey(11), vllmKey(12), vllmKey(13)}
+	got := cb.call(&protocol.Message{Op: protocol.OpAlloc, Keys: keys})
+	allocated := 0
+	for _, st := range got.Status {
+		if st == uint8(pool.Allocated) {
+			allocated++
+		}
+	}
+	if allocated != 3 {
+		t.Fatalf("allocated %d of 4 slots, want 3 while one is held", allocated)
 	}
 }

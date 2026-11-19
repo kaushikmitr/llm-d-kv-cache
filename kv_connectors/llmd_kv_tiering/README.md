@@ -146,6 +146,8 @@ A fetch tries these in order:
 
 A push is preferred because on 4 KiB-page memory an RDMA WRITE ran at about twice the bandwidth of a READ (see the [H200 results](docs/results-2026-11-18-h200.md#rdma)).
 
+**When a transfer fails.** Freeing a NIXL handle does not stop its DMA. So the helper waits until every transfer it started has finished or failed before it answers. If its deadline passes first, it answers "unsafe" and exits, which closes its RDMA connections and stops the transfers. The daemons' deadlines are spaced so that a daemon that gives up knows the helper has answered or exited. After an unsafe failure, the destination keeps the affected pool slots out of use until the helper has surely exited. In the GPU zero-copy path, vLLM's memory is re-registered under a new NIXL agent, so a late write fails at the NIC.
+
 **vLLM on GPU.** With `rdma_zero_copy: true` in the tier's options, the source writes straight into vLLM's CPU tier and skips the destination pool. This removes one host copy.
 
 **vLLM on TPU.** The TPU shim loads blocks to the device straight from the pool. A push into the pool is already the only host copy, so the TPU shim needs no RDMA option. Only the helper and the daemon flag are needed.
