@@ -163,6 +163,13 @@ class LLMDTPUOffloadConnector(_BaseTPUOffloadConnector):
             self._llmd_worker.take_meta(self._get_connector_metadata())
         super().wait_for_save()
 
+    def shutdown(self):
+        if self._llmd_sched is not None:
+            self._llmd_sched.shutdown()
+        if self._llmd_worker is not None:
+            self._llmd_worker.shutdown()
+        super().shutdown()
+
 
 # The TPU platform accepts only a fixed list of connector names, and vLLM
 # loads the class by name from kv_connector_module_path. Exporting the
@@ -217,46 +224,86 @@ class _SchedulerTier:
         self._lock = threading.Lock()
         self._next_virtual = VIRTUAL_BASE
         self._virtual: dict[int, tuple[bytes, int]] = {}  # id -> (key, slot)
-        self._step_virtual: dict[int, int] = {}  # new this step: id -> slot
+        # New this step: id -> (slot, pool id). The pool id lets the worker
+        # refuse a slot of a pool that a restarted daemon has replaced.
+        self._step_virtual: dict[int, tuple[int, int]] = {}
         self._match_req = None
-        # Pins taken while matching, per request, not yet turned into loads.
-        self._held: dict[str, dict[bytes, int]] = {}
+        # Pins taken while matching, per request, not yet turned into loads:
+        # key -> (slot, pool id).
+        self._held: dict[str, dict[bytes, tuple[int, int]]] = {}
         self._fetched_reqs: set[str] = set()
+        # Events that arrive while a connection is set up, applied after its
+        # snapshot. Only events change the mirror; they arrive in the order
+        # the pool changed.
+        self._connecting: list[dict] | None = None
+        self._stop = threading.Event()
         sched.offload_manager = _ManagerProxy(sched.offload_manager, self)
-        threading.Thread(target=self._connect_loop, name="llmd-tpu-sched", daemon=True).start()
+        self._thread = threading.Thread(target=self._connect_loop, name="llmd-tpu-sched", daemon=True)
+        self._thread.start()
 
     # connection
 
-    def _connect_loop(self) -> None:
-        import time
+    def shutdown(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+        client = self._client
+        if client is not None:
+            client.close()
 
-        while True:
+    def _connect_loop(self) -> None:
+        while not self._stop.is_set():
             if self._client is None:
-                try:
-                    c = DaemonClient(
-                        self._conn._llmd_socket,
-                        self._conn._llmd_ns,
-                        0,  # attach: the worker creates the pool
-                        f"tpu-sched/{socket.gethostname()}/{os.getpid()}",
-                        on_event=self._on_event,
-                        on_disconnect=self._on_disconnect,
-                        timeout_s=self._conn._llmd_timeout,
-                    )
-                    keys = c.call("snapshot").get("keys") or []
-                    with self._lock:
-                        self._client = c
-                        self._mirror.update(keys)
-                    logger.info("llm-d TPU tier: scheduler attached, %d blocks in pool", len(keys))
-                except (OSError, DaemonError) as e:
-                    logger.debug("scheduler cannot attach to kvtierd yet: %s", e)
-            time.sleep(1.0)
+                self._connect()
+            self._stop.wait(1.0)
+
+    def _connect(self) -> None:
+        holder: list[DaemonClient] = []
+        with self._lock:
+            self._connecting = []
+        try:
+            c = DaemonClient(
+                self._conn._llmd_socket,
+                self._conn._llmd_ns,
+                0,  # attach: the worker creates the pool
+                f"tpu-sched/{socket.gethostname()}/{os.getpid()}",
+                on_event=self._on_event,
+                on_disconnect=lambda: self._on_disconnect(holder[0] if holder else None),
+                timeout_s=self._conn._llmd_timeout,
+            )
+            resp = c.call("snapshot")
+        except (OSError, DaemonError) as e:
+            logger.debug("scheduler cannot attach to kvtierd yet: %s", e)
+            with self._lock:
+                self._connecting = None
+            return
+        with self._lock:
+            holder.append(c)
+            buffered, self._connecting = self._connecting or [], None
+            if not c.connected:
+                return
+            self._client = c
+            self._mirror.update(resp.get("keys") or ())
+            # The snapshot already reflects events received before its reply.
+            for msg in buffered:
+                if msg["_rx"] > resp["_rx"]:
+                    self._apply_event(msg)
+        logger.info("llm-d TPU tier: scheduler attached, %d blocks in pool", len(resp.get("keys") or ()))
 
     def _on_event(self, msg) -> None:
+        with self._lock:
+            if self._connecting is not None:
+                self._connecting.append(msg)
+                return
+            self._apply_event(msg)
+
+    def _apply_event(self, msg) -> None:
         self._mirror.update(msg.get("stored") or ())
         self._mirror.difference_update(msg.get("removed") or ())
 
-    def _on_disconnect(self) -> None:
+    def _on_disconnect(self, client: DaemonClient | None) -> None:
         with self._lock:
+            if client is None or self._client is not client:
+                return
             self._client = None
             self._mirror.clear()
 
@@ -297,8 +344,9 @@ class _SchedulerTier:
         except DaemonError as e:
             logger.warning("fetch of %d blocks from %s failed: %s", len(keys), hint.endpoint, e)
             return
+        # The daemon's stored events, which arrive before this reply, add
+        # the fetched blocks to the mirror.
         got = [k for k, st in zip(keys, status) if st in (FETCH_OK, FETCH_PRESENT)]
-        self._mirror.update(got)
         logger.info(
             "request %s: pulled %d of %d blocks from %s",
             request.request_id,
@@ -328,9 +376,8 @@ class _SchedulerTier:
         n = 0
         for k, s in zip(keys, slots):
             if s < 0:  # evicted since the mirror saw it: hits stop here
-                self._mirror.discard(k)
                 break
-            held[k] = s
+            held[k] = (s, client.pool_id)
             n += 1
         # Blocks after the gap cannot be used; release their pins at once.
         tail = [k for k, s in zip(keys[n + 1 :], slots[n + 1 :]) if s >= 0]
@@ -354,7 +401,7 @@ class _SchedulerTier:
             raise RuntimeError(f"llm-d TPU tier: no pinned slot for block {k.hex()[:16]}")
         vid = self._next_virtual
         self._next_virtual += 1
-        self._virtual[vid] = (k, slot)
+        self._virtual[vid] = (k, slot[0])
         self._step_virtual[vid] = slot
         return types.SimpleNamespace(chunk_id=vid)
 
@@ -426,12 +473,15 @@ class _WorkerTier:
         self._conn = conn
         self._worker = worker
         self._client: DaemonClient | None = None
-        self._virtual: dict[int, int] = {}  # id -> slot
+        self._virtual: dict[int, tuple[int, int]] = {}  # id -> (slot, pool id)
         self._save_keys: dict[int, bytes] = {}  # chunk id -> key
         self._shape: tuple[int, ...] | None = None
         self._dtype = None
         self._slot_bytes = 0
         self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="llmd-tpu-save")
+        self._stop = threading.Event()
+        self._lost = threading.Event()
+        self._reconnector: threading.Thread | None = None
         worker.cpu_backend = _BackendProxy(worker.cpu_backend, self)
 
     def on_runner(self) -> None:
@@ -449,15 +499,31 @@ class _WorkerTier:
         self._shape = (1, w.num_layers) + tuple(w.shape[1:])
         self._dtype = np.dtype(w.dtype)
         self._slot_bytes = int(np.prod(self._shape)) * self._dtype.itemsize
-        self._client = DaemonClient(
-            self._conn._llmd_socket,
-            self._conn._llmd_ns,
-            self._slot_bytes,
-            f"tpu-worker/{socket.gethostname()}/{os.getpid()}",
-            on_event=lambda m: None,
-            on_disconnect=self._on_disconnect,
-            timeout_s=self._conn._llmd_timeout,
-        )
+        if not self._connect():
+            # The worker creates the pool, so it must reach the daemon once.
+            raise RuntimeError(f"llm-d TPU tier: cannot reach kvtierd at {self._conn._llmd_socket}")
+        self._reconnector = threading.Thread(target=self._reconnect_loop, name="llmd-tpu-worker", daemon=True)
+        self._reconnector.start()
+
+    def _connect(self) -> bool:
+        holder: list[DaemonClient] = []
+        try:
+            client = DaemonClient(
+                self._conn._llmd_socket,
+                self._conn._llmd_ns,
+                self._slot_bytes,
+                f"tpu-worker/{socket.gethostname()}/{os.getpid()}",
+                on_event=lambda m: None,
+                on_disconnect=lambda: self._on_disconnect(holder[0] if holder else None),
+                timeout_s=self._conn._llmd_timeout,
+            )
+        except (OSError, DaemonError) as e:
+            logger.debug("llm-d TPU tier: worker cannot reach kvtierd: %s", e)
+            return False
+        holder.append(client)
+        if not client.connected:
+            return False
+        self._client = client
         logger.info(
             "llm-d TPU tier: worker connected, chunk shape %s %s, %d bytes, ns %s",
             self._shape,
@@ -465,10 +531,40 @@ class _WorkerTier:
             self._slot_bytes,
             self._conn._llmd_ns,
         )
+        return True
 
-    def _on_disconnect(self) -> None:
-        logger.warning("llm-d TPU tier: worker lost kvtierd; saves to the pool stop")
+    def _on_disconnect(self, client: DaemonClient | None) -> None:
+        if client is None or self._client is not client:
+            return
+        logger.warning("llm-d TPU tier: worker lost kvtierd; saves to the pool pause until it is back")
         self._client = None
+        self._lost.set()
+
+    def _reconnect_loop(self) -> None:
+        backoff = 0.5
+        while not self._stop.is_set():
+            self._lost.wait()
+            if self._stop.is_set():
+                return
+            if self._client is not None:
+                self._lost.clear()
+                continue
+            if self._connect():
+                self._lost.clear()
+                backoff = 0.5
+                continue
+            self._stop.wait(backoff)
+            backoff = min(backoff * 2, 10.0)
+
+    def shutdown(self) -> None:
+        self._stop.set()
+        self._lost.set()
+        if self._reconnector is not None:
+            self._reconnector.join(timeout=5)
+        self._pool.shutdown(wait=True)
+        client = self._client
+        if client is not None:
+            client.close()
 
     def take_meta(self, meta) -> None:
         v = getattr(meta, "llmd_virtual", None)
@@ -480,9 +576,15 @@ class _WorkerTier:
 
     def read_virtual(self, vid: int):
         client = self._client
-        slot = self._virtual.pop(vid, None)
-        if client is None or slot is None:
+        entry = self._virtual.pop(vid, None)
+        if client is None or entry is None:
             logger.error("llm-d TPU tier: virtual chunk %d unavailable", vid)
+            return None
+        slot, pool_id = entry
+        if pool_id != client.pool_id:
+            # The daemon restarted between the scheduler's pin and this
+            # load. The slot number belongs to the old pool.
+            logger.error("llm-d TPU tier: virtual chunk %d is from a replaced pool", vid)
             return None
         addr = client.arena.slot_address(slot)
         buf = (ctypes.c_char * self._slot_bytes).from_address(addr)
