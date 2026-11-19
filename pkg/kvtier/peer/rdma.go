@@ -320,10 +320,11 @@ func (h *RDMAHelper) Write(ctx context.Context, peerMeta []byte, slotBytes uint6
 
 // PushRemote asks the source daemon at endpoint to write keys straight into
 // the caller's registered memory: key i goes to dstAddrs[i] in the agent
-// described by dstMeta. It returns a protocol.Fetch* status per key, once
-// the writes are complete.
+// described by dstMeta. When evict is set, the source drops the blocks it
+// wrote. It returns a protocol.Fetch* status per key, once the writes are
+// complete.
 func (n *Node) PushRemote(ctx context.Context, endpoint, ns string, keys [][]byte, slotBytes uint64,
-	dstMeta []byte, dstAddrs []uint64,
+	dstMeta []byte, dstAddrs []uint64, evict bool,
 ) ([]uint8, error) {
 	conn, err := n.get(ctx, endpoint)
 	if err != nil {
@@ -335,7 +336,7 @@ func (n *Node) PushRemote(ctx context.Context, endpoint, ns string, keys [][]byt
 	}
 	req := &protocol.Message{
 		ID: 1, Op: protocol.OpPeerGet, Namespace: ns, Keys: keys, SlotBytes: slotBytes,
-		Push: true, DstMeta: dstMeta, DstAddrs: dstAddrs,
+		Push: true, DstMeta: dstMeta, DstAddrs: dstAddrs, Evict: evict,
 	}
 	if err := writeFrame(conn, req); err != nil {
 		n.put(endpoint, conn, false)
@@ -359,12 +360,21 @@ func (n *Node) PushRemote(ctx context.Context, endpoint, ns string, keys [][]byt
 }
 
 // servePush answers a push peer_get: it writes the pinned blocks into the
-// destination's memory with RDMA, then reports a status per key.
+// destination's memory with RDMA, then reports a status per key. It answers
+// "no_rdma" when its helper is unavailable, so the destination can fetch
+// some other way.
 func (n *Node) servePush(conn net.Conn, req, resp *protocol.Message, slots []int64, found [][]byte,
 	arena *pool.Arena, sid pool.SessionID,
 ) error {
-	defer n.store.Unpin(sid, req.Namespace, found)
-	if n.rdma == nil || len(req.DstAddrs) != len(req.Keys) {
+	unpinned := false
+	unpin := func() {
+		if !unpinned {
+			n.store.Unpin(sid, req.Namespace, found)
+			unpinned = true
+		}
+	}
+	defer unpin()
+	if len(req.DstAddrs) != len(req.Keys) || !n.rdmaReady(context.Background()) {
 		resp.Status = nil
 		resp.Error = "no_rdma"
 		return writeFrame(conn, resp)
@@ -388,5 +398,44 @@ func (n *Node) servePush(conn net.Conn, req, resp *protocol.Message, slots []int
 	}
 	n.Served.Add(uint64(len(found)))
 	n.BytesOut.Add(uint64(len(found)) * arena.SlotBytes())
+	if req.Evict && len(found) > 0 {
+		unpin()
+		if removed := n.store.Remove(req.Namespace, found); len(removed) > 0 {
+			n.notify.AnnounceRemoved(removed)
+		}
+	}
 	return writeFrame(conn, resp)
+}
+
+// fetchPush has the source write want straight into the reserved local pool
+// slots with RDMA WRITE. On 4 KiB-page memory a WRITE runs at about twice
+// the bandwidth of a READ. It returns ErrNoRemoteRDMA when the source
+// cannot push, before anything is transferred.
+func (n *Node) fetchPush(ctx context.Context, endpoint, ns string, want [][]byte, wantIdx []int,
+	slots []int64, status []uint8, ok []bool, evict bool, arena *pool.Arena,
+) error {
+	info, err := n.rdma.Info(ctx, n.opts.Timeout)
+	if err != nil {
+		return err
+	}
+	if info.SlotBytes != arena.SlotBytes() {
+		return fmt.Errorf("rdma helper slot size %d differs from the pool's %d", info.SlotBytes, arena.SlotBytes())
+	}
+	addrs := make([]uint64, len(want))
+	for j, i := range wantIdx {
+		addrs[j] = info.Base + uint64(slots[i])*arena.SlotBytes() // #nosec G115 -- reserved slots are non-negative
+	}
+	st, err := n.PushRemote(ctx, endpoint, ns, want, arena.SlotBytes(), info.Metadata, addrs, evict)
+	if err != nil {
+		return err
+	}
+	for j, s := range st {
+		i := wantIdx[j]
+		status[i] = s
+		if s == protocol.FetchOK {
+			ok[j] = true
+			n.BytesIn.Add(arena.SlotBytes())
+		}
+	}
+	return nil
 }

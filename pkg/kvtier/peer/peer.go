@@ -376,8 +376,14 @@ func (n *Node) Fetch(ctx context.Context, endpoint, ns string, keys [][]byte, ev
 	ok := make([]bool, len(want))
 	mode := "tcp"
 	if n.rdmaReady(ctx) {
-		mode = "rdma"
-		err = n.fetchRDMA(ctx, endpoint, ns, want, wantIdx, slots, status, ok, evict, arena)
+		// Prefer a push: the source writes into our slots. A source that
+		// cannot push is read from instead, or sends over TCP.
+		mode = "rdma-write"
+		err = n.fetchPush(ctx, endpoint, ns, want, wantIdx, slots, status, ok, evict, arena)
+		if errors.Is(err, ErrNoRemoteRDMA) {
+			mode = "rdma-read"
+			err = n.fetchRDMA(ctx, endpoint, ns, want, wantIdx, slots, status, ok, evict, arena)
+		}
 	} else {
 		err = n.fetchTCP(ctx, endpoint, ns, want, wantIdx, slots, status, ok, evict, arena)
 	}

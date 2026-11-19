@@ -40,7 +40,7 @@ func (s *Server) remotePush(ss *session, req, resp *protocol.Message) {
 		return
 	}
 	status, err := s.peer.PushRemote(context.Background(), req.Endpoint, ss.ns, req.Keys,
-		arena.SlotBytes(), req.DstMeta, req.DstAddrs)
+		arena.SlotBytes(), req.DstMeta, req.DstAddrs, req.Evict)
 	switch {
 	case errors.Is(err, peer.ErrNoRemoteRDMA):
 		resp.Error = "no_rdma"

@@ -132,7 +132,10 @@ class Helper:
 
         from nixl._api import nixl_agent, nixl_agent_config
 
-        self.agent = nixl_agent(name, nixl_agent_config(backends=backends, num_threads=num_threads))
+        # Older NIXL releases (0.3, in the TPU image) have no num_threads
+        # option; pass it only when it is set.
+        cfg = {"num_threads": num_threads} if num_threads > 0 else {}
+        self.agent = nixl_agent(name, nixl_agent_config(backends=backends, **cfg))
         self._reg = self.agent.register_memory([(self.base, self.size, 0, "")], "DRAM")
         self.metadata = self.agent.get_agent_metadata()
         logger.info(
