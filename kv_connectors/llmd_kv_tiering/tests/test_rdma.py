@@ -122,3 +122,24 @@ def test_coalesce_merges_consecutive_slots():
 
     assert coalesce([(0, 10), (1, 11), (2, 12), (5, 3)], 100) == [(0, 1000, 300), (500, 300, 100)]
     assert coalesce([(0, 1), (1, 0)], 100) == [(0, 100, 100), (100, 0, 100)]
+
+
+def test_split_runs_balances_bytes():
+    from llmd_kv_tiering.rdma_helper import split_runs
+
+    runs = [(0, 0, 800)]
+    groups = split_runs(runs, 4)
+    assert [sum(n for _, _, n in g) for g in groups] == [200, 200, 200, 200]
+    assert groups[1] == [(200, 200, 200)]
+    groups = split_runs([(0, 0, 100), (500, 900, 300)], 2)
+    assert [sum(n for _, _, n in g) for g in groups] == [200, 200]
+    assert split_runs([(0, 0, 100)], 8) == [
+        [(0, 0, 13)],
+        [(13, 13, 13)],
+        [(26, 26, 13)],
+        [(39, 39, 13)],
+        [(52, 52, 13)],
+        [(65, 65, 13)],
+        [(78, 78, 13)],
+        [(91, 91, 9)],
+    ]

@@ -65,10 +65,44 @@ def coalesce(pairs: list[tuple[int, int]], slot_bytes: int) -> list[tuple[int, i
     return out
 
 
+def split_runs(runs: list[tuple[int, int, int]], parts: int) -> list[list[tuple[int, int, int]]]:
+    """Split runs into at most `parts` groups of about equal byte count.
+
+    A run longer than its share is cut, so one large contiguous read still
+    spreads over several transfers.
+    """
+    total = sum(n for _lo, _ro, n in runs)
+    if parts <= 1 or total == 0:
+        return [runs] if runs else []
+    share = -(-total // parts)  # ceiling
+    groups: list[list[tuple[int, int, int]]] = [[]]
+    room = share
+    for lo, ro, n in runs:
+        while n > 0:
+            take = min(n, room)
+            groups[-1].append((lo, ro, take))
+            lo, ro, n, room = lo + take, ro + take, n - take, room - take
+            if room == 0 and len(groups) < parts:
+                groups.append([])
+                room = share
+    return [g for g in groups if g]
+
+
 class Helper:
-    def __init__(self, daemon_socket: str, name: str, backends: list[str], timeout_s: float) -> None:
+    def __init__(
+        self,
+        daemon_socket: str,
+        name: str,
+        backends: list[str],
+        timeout_s: float,
+        parallel: int = 8,
+        num_threads: int = 0,
+    ) -> None:
         self.name = name
         self.timeout = timeout_s
+        # A read is split into this many concurrent NIXL transfers. One
+        # transfer drives one queue pair and does not fill a fast NIC.
+        self.parallel = max(1, parallel)
         self._lock = threading.Lock()
         self._known_peers: set[str] = set()
         self.client = self._attach(daemon_socket)
@@ -77,7 +111,7 @@ class Helper:
 
         from nixl._api import nixl_agent, nixl_agent_config
 
-        self.agent = nixl_agent(name, nixl_agent_config(backends=backends))
+        self.agent = nixl_agent(name, nixl_agent_config(backends=backends, num_threads=num_threads))
         self._reg = self.agent.register_memory([(self.base, self.size, 0, "")], "DRAM")
         self.metadata = self.agent.get_agent_metadata()
         logger.info(
@@ -134,20 +168,31 @@ class Helper:
                 added = self.agent.add_remote_agent(base64.b64decode(req["peer_metadata"]))
                 name = added.decode() if isinstance(added, bytes) else added
                 self._known_peers.add(name)
-            local = self.agent.get_xfer_descs([(self.base + lo, n, 0) for lo, _ro, n in runs], "DRAM")
-            remote = self.agent.get_xfer_descs([(remote_base + ro, n, 0) for _lo, ro, n in runs], "DRAM")
-            handle = self.agent.initialize_xfer("READ", local, remote, peer)
+            handles = []
             try:
-                state = self.agent.transfer(handle)
+                for group in split_runs(runs, self.parallel):
+                    local = self.agent.get_xfer_descs([(self.base + lo, n, 0) for lo, _ro, n in group], "DRAM")
+                    remote = self.agent.get_xfer_descs([(remote_base + ro, n, 0) for _lo, ro, n in group], "DRAM")
+                    handle = self.agent.initialize_xfer("READ", local, remote, peer)
+                    handles.append(handle)
+                    if self.agent.transfer(handle) == "ERR":
+                        return {"error": "RDMA read failed to start"}
                 deadline = time.monotonic() + self.timeout
-                while state not in ("DONE", "ERR"):
+                pending = list(handles)
+                while pending:
                     if time.monotonic() > deadline:
                         return {"error": "RDMA read timed out"}
-                    state = self.agent.check_xfer_state(handle)
-                if state == "ERR":
-                    return {"error": "RDMA read failed"}
+                    still = []
+                    for handle in pending:
+                        state = self.agent.check_xfer_state(handle)
+                        if state == "ERR":
+                            return {"error": "RDMA read failed"}
+                        if state != "DONE":
+                            still.append(handle)
+                    pending = still
             finally:
-                self.agent.release_xfer_handle(handle)
+                for handle in handles:
+                    self.agent.release_xfer_handle(handle)
         return {}
 
 
@@ -190,10 +235,12 @@ def main() -> None:
     ap.add_argument("--name", default=f"kvtier-{socket.gethostname()}")
     ap.add_argument("--backends", default="UCX", help="comma-separated NIXL backends")
     ap.add_argument("--timeout-s", type=float, default=30.0)
+    ap.add_argument("--parallel", type=int, default=8, help="concurrent NIXL transfers per read")
+    ap.add_argument("--num-threads", type=int, default=0, help="NIXL backend threads (0 = NIXL default)")
     ap.add_argument("--log-level", default="INFO")
     a = ap.parse_args()
     logging.basicConfig(level=a.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    helper = Helper(a.daemon_socket, a.name, a.backends.split(","), a.timeout_s)
+    helper = Helper(a.daemon_socket, a.name, a.backends.split(","), a.timeout_s, a.parallel, a.num_threads)
     serve(helper, a.listen_socket)
 
 
