@@ -42,12 +42,12 @@ def rdma_node(daemon_factory):
     """A daemon with an RDMA helper, and one engine tier on it."""
     made: list = []
 
-    def node(with_helper: bool = True):
+    def node(with_helper: bool = True, **tier_kw):
         helper_sock = Path(f"/tmp/kvtier-rdma-{os.getpid()}-{len(made)}-{time.monotonic_ns()}.sock")
         args = ["--rdma-helper-socket", str(helper_sock)] if with_helper else []
         d = daemon_factory(extra_args=args)
         arr = primary()
-        tier = make_tier(d, arr)  # creates the pool, which the helper attaches to
+        tier = make_tier(d, arr, **tier_kw)  # creates the pool, which the helper attaches to
         proc = None
         if with_helper:
             env = dict(os.environ, PYTHONPATH=f"{ROOT}:{os.environ.get('PYTHONPATH', '')}")
@@ -143,3 +143,33 @@ def test_split_runs_balances_bytes():
         [(78, 78, 13)],
         [(91, 91, 9)],
     ]
+
+
+def test_zero_copy_reads_into_engine_memory(rdma_node):
+    """The destination engine reads the source pool straight into its own
+    CPU tier. The blocks never enter the destination's pool."""
+    _, arr_a, a = rdma_node()
+    d_b, arr_b, b = rdma_node(with_helper=False, rdma_zero_copy=True)
+    keys = stored_on_a(arr_a, a, n=3)
+
+    res = _fetch_with_hint(a, b, arr_b, keys, [2, 5, 6])
+    assert res.success
+    np.testing.assert_array_equal(arr_b[2], expected(10))
+    np.testing.assert_array_equal(arr_b[5], expected(11))
+    np.testing.assert_array_equal(arr_b[6], expected(12))
+    assert "fetched blocks" not in d_b.log_path.read_text()  # no pooled fetch
+    assert b.lookup(keys[0], ReqContext(req_id="other")) is LookupResult.MISS
+    # The source's pins were released: it can still serve and evict normally.
+    assert a.lookup(keys[0], ReqContext(req_id="x")) is LookupResult.HIT
+
+
+def test_zero_copy_falls_back_without_source_helper(rdma_node):
+    _, arr_a, a = rdma_node(with_helper=False)
+    _, arr_b, b = rdma_node(with_helper=False, rdma_zero_copy=True)
+    keys = stored_on_a(arr_a, a, n=2)
+
+    res = _fetch_with_hint(a, b, arr_b, keys, [3, 4])
+    assert res.success
+    np.testing.assert_array_equal(arr_b[3], expected(10))
+    # The pooled path ran, so the blocks are now in b's pool.
+    assert b.lookup(keys[0], ReqContext(req_id="other")) is LookupResult.HIT
