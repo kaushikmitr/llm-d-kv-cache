@@ -497,14 +497,22 @@ func (n *Node) Offer(ctx context.Context, endpoint, ns string, keys [][]byte, ev
 
 func (n *Node) get(ctx context.Context, endpoint string) (net.Conn, error) {
 	addr := HostPort(endpoint)
-	n.mu.Lock()
-	if cs := n.idle[addr]; len(cs) > 0 {
+	for {
+		n.mu.Lock()
+		cs := n.idle[addr]
+		if len(cs) == 0 {
+			n.mu.Unlock()
+			break
+		}
 		c := cs[len(cs)-1]
 		n.idle[addr] = cs[:len(cs)-1]
 		n.mu.Unlock()
-		return c, nil
+		if idleAlive(c) {
+			return c, nil
+		}
+		// The peer closed it, for example because its daemon restarted.
+		c.Close()
 	}
-	n.mu.Unlock()
 	d := net.Dialer{Timeout: n.opts.Timeout}
 	c, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
@@ -516,6 +524,23 @@ func (n *Node) get(ctx context.Context, endpoint string) (net.Conn, error) {
 		}
 	}
 	return c, nil
+}
+
+// idleAlive reports whether an idle connection is still open. An idle
+// connection has nothing to read, so a read that returns at once, with
+// data, EOF or an error, means the peer closed or broke it. A restarted
+// daemon leaves every pooled connection to it in that state.
+func idleAlive(c net.Conn) bool {
+	if err := c.SetReadDeadline(time.Now().Add(time.Millisecond)); err != nil {
+		return false
+	}
+	var b [1]byte
+	_, err := c.Read(b[:])
+	var ne net.Error
+	if !errors.As(err, &ne) || !ne.Timeout() {
+		return false
+	}
+	return c.SetReadDeadline(time.Time{}) == nil
 }
 
 func (n *Node) put(endpoint string, c net.Conn, healthy bool) {
