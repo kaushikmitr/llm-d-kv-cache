@@ -26,6 +26,12 @@ Requests and responses are JSON lines:
     {"op": "read", "peer", "peer_metadata" (base64), "remote_base",
      "slot_bytes", "pairs": [[local_slot, remote_slot], ...]}
         -> {} on success, {"error": "..."} on failure
+    {"op": "write", "peer_metadata" (base64), "slot_bytes",
+     "pairs": [[local_slot, remote_address], ...]}
+        -> {} once every block is written to the peer's memory
+
+RDMA WRITE is preferred where the source can push: on 4 KiB pages a
+WRITE reaches about twice the bandwidth of a READ.
 
 Run it as: python -m llmd_kv_tiering.rdma_helper --daemon-socket S --listen-socket L
 """
@@ -34,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -88,6 +95,20 @@ def split_runs(runs: list[tuple[int, int, int]], parts: int) -> list[list[tuple[
     return [g for g in groups if g]
 
 
+def coalesce_to_addrs(pairs: list[tuple[int, int]], slot_bytes: int) -> list[tuple[int, int, int]]:
+    """Merge runs where the local slot advances by one and the remote
+    address by one slot. Returns (local_offset, remote_address, length)."""
+    out: list[tuple[int, int, int]] = []
+    for local, addr in sorted(pairs):
+        lo = local * slot_bytes
+        if out and out[-1][0] + out[-1][2] == lo and out[-1][1] + out[-1][2] == addr:
+            prev = out[-1]
+            out[-1] = (prev[0], prev[1], prev[2] + slot_bytes)
+        else:
+            out.append((lo, addr, slot_bytes))
+    return out
+
+
 class Helper:
     def __init__(
         self,
@@ -104,7 +125,7 @@ class Helper:
         # transfer drives one queue pair and does not fill a fast NIC.
         self.parallel = max(1, parallel)
         self._lock = threading.Lock()
-        self._known_peers: set[str] = set()
+        self._peer_by_meta: dict[str, str] = {}
         self.client = self._attach(daemon_socket)
         arena = self.client.arena
         self.base, self.size, self.slot_bytes = arena.base, arena.size, arena.slot_bytes
@@ -153,47 +174,70 @@ class Helper:
             "slot_bytes": self.slot_bytes,
         }
 
+    def _peer(self, metadata_b64: str) -> str:
+        meta = base64.b64decode(metadata_b64)
+        digest = hashlib.sha256(meta).hexdigest()
+        name = self._peer_by_meta.get(digest)
+        if name is None:
+            added = self.agent.add_remote_agent(meta)
+            name = added.decode() if isinstance(added, bytes) else added
+            self._peer_by_meta[digest] = name
+        return name
+
+    def _run(self, op: str, runs: list[tuple[int, int, int]], peer: str) -> dict:
+        """Run `op` over (local_offset, remote_address, length) runs, in
+        parallel groups, and wait for all of them."""
+        handles = []
+        try:
+            for group in split_runs(runs, self.parallel):
+                local = self.agent.get_xfer_descs([(self.base + lo, n, 0) for lo, _ra, n in group], "DRAM")
+                remote = self.agent.get_xfer_descs([(ra, n, 0) for _lo, ra, n in group], "DRAM")
+                handle = self.agent.initialize_xfer(op, local, remote, peer)
+                handles.append(handle)
+                if self.agent.transfer(handle) == "ERR":
+                    return {"error": f"RDMA {op} failed to start"}
+            deadline = time.monotonic() + self.timeout
+            pending = list(handles)
+            while pending:
+                if time.monotonic() > deadline:
+                    return {"error": f"RDMA {op} timed out"}
+                still = []
+                for handle in pending:
+                    state = self.agent.check_xfer_state(handle)
+                    if state == "ERR":
+                        return {"error": f"RDMA {op} failed"}
+                    if state != "DONE":
+                        still.append(handle)
+                pending = still
+        finally:
+            for handle in handles:
+                self.agent.release_xfer_handle(handle)
+        return {}
+
+    def write(self, req: dict) -> dict:
+        slot_bytes = int(req["slot_bytes"])
+        if slot_bytes != self.slot_bytes:
+            return {"error": f"slot size {slot_bytes} does not match local {self.slot_bytes}"}
+        runs = coalesce_to_addrs([(int(local), int(addr)) for local, addr in req["pairs"]], slot_bytes)
+        for lo, _ra, n in runs:
+            if lo + n > self.size:
+                return {"error": "local slot outside the pool"}
+        with self._lock:
+            peer = self._peer(req["peer_metadata"])
+            return self._run("WRITE", runs, peer)
+
     def read(self, req: dict) -> dict:
         slot_bytes = int(req["slot_bytes"])
         if slot_bytes != self.slot_bytes:
             return {"error": f"slot size {slot_bytes} does not match local {self.slot_bytes}"}
-        peer = req["peer"]
         remote_base = int(req["remote_base"])
         runs = coalesce([(int(local), int(remote)) for local, remote in req["pairs"]], slot_bytes)
         for lo, _ro, n in runs:
             if lo + n > self.size:
                 return {"error": "local slot outside the pool"}
         with self._lock:
-            if peer not in self._known_peers:
-                added = self.agent.add_remote_agent(base64.b64decode(req["peer_metadata"]))
-                name = added.decode() if isinstance(added, bytes) else added
-                self._known_peers.add(name)
-            handles = []
-            try:
-                for group in split_runs(runs, self.parallel):
-                    local = self.agent.get_xfer_descs([(self.base + lo, n, 0) for lo, _ro, n in group], "DRAM")
-                    remote = self.agent.get_xfer_descs([(remote_base + ro, n, 0) for _lo, ro, n in group], "DRAM")
-                    handle = self.agent.initialize_xfer("READ", local, remote, peer)
-                    handles.append(handle)
-                    if self.agent.transfer(handle) == "ERR":
-                        return {"error": "RDMA read failed to start"}
-                deadline = time.monotonic() + self.timeout
-                pending = list(handles)
-                while pending:
-                    if time.monotonic() > deadline:
-                        return {"error": "RDMA read timed out"}
-                    still = []
-                    for handle in pending:
-                        state = self.agent.check_xfer_state(handle)
-                        if state == "ERR":
-                            return {"error": "RDMA read failed"}
-                        if state != "DONE":
-                            still.append(handle)
-                    pending = still
-            finally:
-                for handle in handles:
-                    self.agent.release_xfer_handle(handle)
-        return {}
+            peer = self._peer(req["peer_metadata"])
+            return self._run("READ", [(lo, remote_base + ro, n) for lo, ro, n in runs], peer)
 
 
 def serve(helper: Helper, path: str) -> None:
@@ -215,6 +259,8 @@ def serve(helper: Helper, path: str) -> None:
                         resp = helper.info()
                     elif op == "read":
                         resp = helper.read(req)
+                    elif op == "write":
+                        resp = helper.write(req)
                     else:
                         resp = {"error": f"unknown op {op!r}"}
                 except Exception as e:  # noqa: BLE001 - every failure becomes a response

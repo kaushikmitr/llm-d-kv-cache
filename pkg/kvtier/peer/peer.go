@@ -258,6 +258,9 @@ func (n *Node) serveGet(conn net.Conn, req *protocol.Message) error {
 		resp.Status[i] = protocol.FetchOK
 		found = append(found, req.Keys[i])
 	}
+	if req.Push {
+		return n.servePush(conn, req, resp, slots, found, arena, sid)
+	}
 	if req.RDMA && n.rdma != nil {
 		handled, err := n.serveRDMA(conn, req, resp, slots, found, arena, sid)
 		if handled || err != nil {

@@ -55,9 +55,9 @@ const (
 	// slots, and the source may drop its pins.
 	OpPeerRelease = "peer_release"
 
-	// Local requests for an engine that reads peer blocks itself with RDMA.
-	OpRemoteGet     = "remote_get"     // lease a source's pins on keys; returns where they sit
-	OpRemoteRelease = "remote_release" // end a lease
+	// OpRemotePush asks a source daemon to RDMA-write blocks straight into
+	// engine memory that the requesting engine registered with NIXL.
+	OpRemotePush = "remote_push"
 )
 
 // Per-key outcome of a fetch.
@@ -113,7 +113,12 @@ type Message struct {
 	Agent     string `msgpack:"agent,omitempty"`      // source helper's NIXL agent name
 	AgentMeta []byte `msgpack:"agent_meta,omitempty"` // source helper's NIXL metadata
 	Base      uint64 `msgpack:"base,omitempty"`       // address of the source pool's slot 0
-	Lease     uint64 `msgpack:"lease,omitempty"`      // remote_get / remote_release
+
+	// remote_push, and peer_get with Push: write the blocks into the
+	// destination's registered memory at DstAddrs, one address per key.
+	Push     bool     `msgpack:"push,omitempty"`
+	DstMeta  []byte   `msgpack:"dst_meta,omitempty"`  // destination's NIXL metadata
+	DstAddrs []uint64 `msgpack:"dst_addrs,omitempty"` // destination address per key
 
 	// stats
 	Stats map[string]any `msgpack:"stats,omitempty"`

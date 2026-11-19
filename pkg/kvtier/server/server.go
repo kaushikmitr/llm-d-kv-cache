@@ -71,9 +71,6 @@ type Server struct {
 	releases sync.WaitGroup
 	stop     chan struct{}
 
-	leaseMu   sync.Mutex
-	nextLease uint64
-	leases    map[uint64]*lease // remote_get leases not yet released
 }
 
 type session struct {
@@ -115,7 +112,6 @@ func New(store *pool.Store, log *slog.Logger) *Server {
 	return &Server{
 		store: store, log: log,
 		sessions: make(map[pool.SessionID]*session),
-		leases:   make(map[uint64]*lease),
 		conns:    make(map[*net.UnixConn]struct{}),
 		grace:    DefaultReleaseGrace,
 		stop:     make(chan struct{}),
@@ -263,7 +259,6 @@ func (s *Server) handle(conn *net.UnixConn) {
 		delete(s.sessions, ss.id)
 		s.mu.Unlock()
 		s.release(ss.id)
-		s.releaseLeases(ss.id)
 		s.log.Info("client disconnected", "session", ss.id, "client", ss.client)
 	}()
 
@@ -276,7 +271,7 @@ func (s *Server) handle(conn *net.UnixConn) {
 			}
 			return
 		}
-		if req.Op == protocol.OpFetch || req.Op == protocol.OpPush || req.Op == protocol.OpRemoteGet {
+		if req.Op == protocol.OpFetch || req.Op == protocol.OpPush || req.Op == protocol.OpRemotePush {
 			// These wait on the network; do not hold up the session's other
 			// requests.
 			go s.reply(ss, s.dispatch(ss, req))
@@ -435,10 +430,8 @@ func (s *Server) dispatch(ss *session, req *protocol.Message) *protocol.Message 
 				resp.Error = err.Error()
 			}
 		}
-	case protocol.OpRemoteGet:
-		s.remoteGet(ss, req, resp)
-	case protocol.OpRemoteRelease:
-		s.remoteRelease(ss, req, resp)
+	case protocol.OpRemotePush:
+		s.remotePush(ss, req, resp)
 	case protocol.OpPush:
 		if s.peer == nil {
 			resp.Error = "peer transfer is disabled on this daemon"

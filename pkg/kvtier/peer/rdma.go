@@ -304,3 +304,89 @@ func (n *Node) fetchRDMA(ctx context.Context, endpoint, ns string, want [][]byte
 	healthy = true
 	return nil
 }
+
+// ErrNoRemoteRDMA means the source cannot push blocks with RDMA. The caller
+// should fetch them into its pool instead.
+var ErrNoRemoteRDMA = errors.New("source does not serve RDMA")
+
+// Write copies local slots to remote addresses with RDMA writes. Each pair
+// is [local slot, remote address].
+func (h *RDMAHelper) Write(ctx context.Context, peerMeta []byte, slotBytes uint64, pairs [][2]int64,
+	timeout time.Duration,
+) error {
+	_, err := h.call(ctx, &rdmaRequest{Op: "write", PeerMeta: peerMeta, SlotBytes: slotBytes, Pairs: pairs}, timeout)
+	return err
+}
+
+// PushRemote asks the source daemon at endpoint to write keys straight into
+// the caller's registered memory: key i goes to dstAddrs[i] in the agent
+// described by dstMeta. It returns a protocol.Fetch* status per key, once
+// the writes are complete.
+func (n *Node) PushRemote(ctx context.Context, endpoint, ns string, keys [][]byte, slotBytes uint64,
+	dstMeta []byte, dstAddrs []uint64,
+) ([]uint8, error) {
+	conn, err := n.get(ctx, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	if err := conn.SetDeadline(time.Now().Add(n.opts.Timeout)); err != nil {
+		n.put(endpoint, conn, false)
+		return nil, err
+	}
+	req := &protocol.Message{
+		ID: 1, Op: protocol.OpPeerGet, Namespace: ns, Keys: keys, SlotBytes: slotBytes,
+		Push: true, DstMeta: dstMeta, DstAddrs: dstAddrs,
+	}
+	if err := writeFrame(conn, req); err != nil {
+		n.put(endpoint, conn, false)
+		return nil, err
+	}
+	resp, err := protocol.Read(conn)
+	if err != nil {
+		n.put(endpoint, conn, false)
+		return nil, err
+	}
+	n.put(endpoint, conn, true)
+	switch {
+	case resp.Error == "no_rdma":
+		return nil, ErrNoRemoteRDMA
+	case resp.Error != "":
+		return nil, fmt.Errorf("source %s: %s", endpoint, resp.Error)
+	case len(resp.Status) != len(keys):
+		return nil, fmt.Errorf("source %s returned %d statuses for %d keys", endpoint, len(resp.Status), len(keys))
+	}
+	return resp.Status, nil
+}
+
+// servePush answers a push peer_get: it writes the pinned blocks into the
+// destination's memory with RDMA, then reports a status per key.
+func (n *Node) servePush(conn net.Conn, req, resp *protocol.Message, slots []int64, found [][]byte,
+	arena *pool.Arena, sid pool.SessionID,
+) error {
+	defer n.store.Unpin(sid, req.Namespace, found)
+	if n.rdma == nil || len(req.DstAddrs) != len(req.Keys) {
+		resp.Status = nil
+		resp.Error = "no_rdma"
+		return writeFrame(conn, resp)
+	}
+	var pairs [][2]int64
+	for i, s := range slots {
+		if s >= 0 {
+			pairs = append(pairs, [2]int64{s, int64(req.DstAddrs[i])}) // #nosec G115 -- user-space addresses fit in int64
+		}
+	}
+	if len(pairs) > 0 {
+		if err := n.rdma.Write(context.Background(), req.DstMeta, arena.SlotBytes(), pairs, n.opts.Timeout); err != nil {
+			n.log.Warn("rdma push failed", "err", err)
+			for i, s := range slots {
+				if s >= 0 {
+					resp.Status[i] = protocol.FetchFailed
+				}
+			}
+			return writeFrame(conn, resp)
+		}
+	}
+	n.Served.Add(uint64(len(found)))
+	n.BytesOut.Add(uint64(len(found)) * arena.SlotBytes())
+	return writeFrame(conn, resp)
+}
